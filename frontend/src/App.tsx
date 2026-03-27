@@ -31,6 +31,9 @@ export default function App() {
   const logsEndRef = useRef<HTMLDivElement>(null);
   const selectedLangRef = useRef(selectedLang);
   const audioRef = useRef<HTMLAudioElement | null>(null);
+  const ttsUnlockedRef = useRef(false);
+  const speechQueueRef = useRef<string[]>([]);
+  const isInternalSpeakingRef = useRef(false);
 
   useEffect(() => { selectedLangRef.current = selectedLang; }, [selectedLang]);
 
@@ -47,12 +50,59 @@ export default function App() {
     logsEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [logs]);
 
-  // Play base64-encoded MP3 audio from the server
+  // Speak text using browser SpeechSynthesis with queue management
+  const speakChunk = useCallback((text: string) => {
+    if (!text.trim()) return;
+
+    // Add to queue
+    speechQueueRef.current.push(text);
+
+    const processQueue = () => {
+      if (isInternalSpeakingRef.current || speechQueueRef.current.length === 0) return;
+
+      const nextText = speechQueueRef.current.shift();
+      if (!nextText) return;
+
+      const synth = window.speechSynthesis;
+      const utterance = new SpeechSynthesisUtterance(nextText);
+
+      // Map language
+      const lang = selectedLangRef.current;
+      if (lang.startsWith('hi')) utterance.lang = 'hi-IN';
+      else if (lang.startsWith('ta')) utterance.lang = 'ta-IN';
+      else utterance.lang = 'en-US';
+
+      utterance.onstart = () => {
+        isInternalSpeakingRef.current = true;
+        setIsSpeaking(true);
+      };
+
+      utterance.onend = () => {
+        isInternalSpeakingRef.current = false;
+        processQueue(); // Process next in queue
+        if (speechQueueRef.current.length === 0) {
+          setIsSpeaking(false);
+        }
+      };
+
+      utterance.onerror = (e) => {
+        console.error('[TTS] Error:', e);
+        isInternalSpeakingRef.current = false;
+        processQueue();
+      };
+
+      synth.speak(utterance);
+    };
+
+    processQueue();
+  }, []);
+
+  // Play base64-encoded MP3 audio from the server (Fallback)
   const playAudio = useCallback((audioBase64: string) => {
-    // Stop any currently playing audio
-    if (audioRef.current) {
-      audioRef.current.pause();
-      audioRef.current = null;
+    // If we are already speaking chunks, ignore the final audio block to avoid doubling
+    if (isInternalSpeakingRef.current || speechQueueRef.current.length > 0) {
+      console.log('[Audio] Ignoring server audio because streaming TTS is active');
+      return;
     }
 
     try {
@@ -86,7 +136,7 @@ export default function App() {
   const connectWebSocket = useCallback(() => {
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) return;
 
-    const ws = new WebSocket('ws://localhost:8000/ws/voice');
+    const ws = new WebSocket('ws://localhost:8001/ws/voice');
 
     ws.onopen = () => {
       setIsConnected(true);
@@ -106,23 +156,29 @@ export default function App() {
           addLog(data.event, isToolTrace ? 'tool' : 'info');
         }
 
-        if (data.type === 'agent.response') {
-          // Safety net: strip any leaked function XML from agent response
-          const cleanText = (data.text || '')
-            .replace(/<function=\w+>.*?<\/function>/gs, '')
-            .replace(/<\/?function[^>]*>/g, '')
-            .replace(/\s{2,}/g, ' ')
-            .trim();
+        if (data.type === 'agent.response_chunk') {
+          const content = data.text || '';
+          setAgentText(prev => prev + content);
 
-          setAgentText(cleanText);
-          setLatency(data.latency_ms);
-          addLog(`Agent: "${cleanText.substring(0, 80)}..."`, 'response');
+          // Speak chunks as they arrive (heuristic: speak on punctuation or length)
+          const cleanChunk = content.replace(/[*#_]/g, '');
+          if (cleanChunk.match(/[.!?\n]/)) {
+            speakChunk(cleanChunk);
+          }
         }
 
-        // Play server-generated TTS audio
+        if (data.type === 'agent.response') {
+          // Final text arrived
+          setLatency(data.latency_ms);
+          addLog(`Agent responded in ${data.latency_ms}ms`, 'info');
+
+          // Ensure any remaining text in the buffer is spoken
+          // We can use a small delay to see if everything was already spoken via chunks
+        }
+
+        // Play server-generated TTS audio (Fallback/Higher Quality)
         if (data.type === 'agent.audio' && data.audio) {
-          console.log('[Audio] Received server TTS audio, playing...');
-          addLog('Playing agent audio...', 'info');
+          console.log('[Audio] Received final audio block');
           playAudio(data.audio);
         }
       } catch (e) { /* ignore */ }
@@ -138,11 +194,25 @@ export default function App() {
     };
 
     wsRef.current = ws;
-  }, [addLog, playAudio]);
+  }, [addLog, playAudio, speakChunk]);
 
 
 
   const startListening = useCallback(() => {
+    // *** CRITICAL: Unlock speechSynthesis with a user gesture ***
+    if (!ttsUnlockedRef.current) {
+      const synth = window.speechSynthesis;
+      synth.cancel();
+      const unlockUtterance = new SpeechSynthesisUtterance(' ');
+      unlockUtterance.volume = 0;
+      unlockUtterance.onend = () => {
+        console.log('[TTS] Unlocked');
+        ttsUnlockedRef.current = true;
+      };
+      synth.speak(unlockUtterance);
+    }
+
+    setAgentText(''); // Clear previous response
     connectWebSocket();
 
     const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
@@ -173,7 +243,11 @@ export default function App() {
       setTranscript(interimTranscript || finalTranscript);
 
       if (finalTranscript.trim()) {
-        // Barge-in: stop agent audio if user starts talking
+        // Barge-in: stop EVERYTHING
+        window.speechSynthesis.cancel();
+        speechQueueRef.current = [];
+        isInternalSpeakingRef.current = false;
+
         if (audioRef.current) {
           audioRef.current.pause();
           audioRef.current = null;
@@ -187,8 +261,9 @@ export default function App() {
             text: finalTranscript.trim(),
             lang: selectedLangRef.current
           }));
+          setAgentText('');
+          setTranscript('');
         }
-        setTranscript('');
       }
     };
 
@@ -208,6 +283,9 @@ export default function App() {
       recognitionRef.current.stop();
       recognitionRef.current = null;
     }
+    window.speechSynthesis.cancel();
+    speechQueueRef.current = [];
+    isInternalSpeakingRef.current = false;
     if (audioRef.current) {
       audioRef.current.pause();
       audioRef.current = null;

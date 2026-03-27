@@ -12,28 +12,37 @@ from app.db.dal import db
 
 
 def clean_agent_response(text: str) -> str:
-    """Strip leaked function-call XML and other artifacts from LLM text output.
+    """Strip leaked function-call artifacts from LLM text output.
     
-    Llama 3.3 sometimes embeds raw function tags like:
-      <function=book_appointment>{"date":"2026-03-27",...}</function>
+    Llama models sometimes embed raw function tags or custom markers like:
+      -function=book_appointment>{"date":"..."}
+      <function=book_appointment>...</function>
     This must be removed before displaying or speaking the response.
     """
-    # Remove <function=...>...</function> blocks
-    text = re.sub(r'<function=\w+>.*?</function>', '', text, flags=re.DOTALL)
+    # Remove -function=name>... and <function=name>... patterns
+    # Matches starting with '-' or '<', followed by 'function=', then name, then optional JSON/XML
+    text = re.sub(r'[-<]function=\w+>.*?(?:</function>|$)', '', text, flags=re.DOTALL | re.IGNORECASE)
+    
     # Remove any remaining lone <function> or </function> tags
-    text = re.sub(r'</?function[^>]*>', '', text)
+    text = re.sub(r'</?function[^>]*>', '', text, flags=re.IGNORECASE)
+    
+    # Remove any stray JSON-like blocks that look like function args if they are alone
+    # (e.g., {"doctor_id": "doc_1"}) if they appear at the start/end of a line
+    text = re.sub(r'^\s*\{".*?"\s*:\s*".*?"\}\s*$', '', text, flags=re.MULTILINE)
+
     # Remove markdown bold/italic/headers
     text = re.sub(r'[*#_]+', '', text)
-    # Clean up extra whitespace
-    text = re.sub(r'\s{2,}', ' ', text).strip()
-    return text
+    
+    # Clean up extra whitespace and newlines
+    text = re.sub(r'\s{2,}', ' ', text)
+    return text.strip()
 
 logger = logging.getLogger(__name__)
 
 def get_groq_client():
     """Lazy initialization so .env changes are picked up on reload."""
     api_key = settings.GROQ_API_KEY
-    if not api_key or api_key == "your-groq-api-key-here":
+    if not api_key:
         raise ValueError("GROQ_API_KEY is not set! Please update backend/.env with your real key.")
     return Groq(api_key=api_key)
 
@@ -108,103 +117,140 @@ async def handle_websocket_connection(websocket: WebSocket):
                 max_iterations = 5
                 for iteration in range(max_iterations):
                     try:
-                        response = get_groq_client().chat.completions.create(
-                            model="llama-3.3-70b-versatile",
+                        # We use streaming to reduce latency
+                        stream = get_groq_client().chat.completions.create(
+                            model="llama-3.1-8b-instant",
                             messages=sessions[session_id],
                             tools=TOOLS,
                             tool_choice="auto",
                             max_tokens=300,
+                            stream=True
                         )
-                    except Exception as api_err:
-                        # Handle Groq tool_use_failed or other API errors gracefully
-                        logger.warning(f"Groq API error (attempt {iteration+1}): {api_err}")
-                        await websocket.send_text(json.dumps({
-                            "type": "trace",
-                            "event": f"Tool call error, retrying without tools..."
-                        }))
-                        # Retry without tools as fallback
-                        try:
-                            response = get_groq_client().chat.completions.create(
-                                model="llama-3.3-70b-versatile",
-                                messages=sessions[session_id],
-                                max_tokens=300,
-                            )
-                        except Exception as fallback_err:
-                            logger.error(f"Fallback also failed: {fallback_err}")
+                        
+                        full_content = ""
+                        tool_calls = {} # tool_index -> tool_call_object
+                        finish_reason = None
+                        
+                        for chunk in stream:
+                            if not chunk.choices:
+                                continue
+                            
+                            delta = chunk.choices[0].delta
+                            finish_reason = chunk.choices[0].finish_reason
+                            
+                            # Handle content chunks
+                            if delta.content:
+                                content = delta.content
+                                full_content += content
+                                # Send chunk to frontend immediately for low-latency display
+                                await websocket.send_text(json.dumps({
+                                    "type": "agent.response_chunk",
+                                    "text": content
+                                }))
+                            
+                            # Handle tool call chunks
+                            if delta.tool_calls:
+                                for tc_chunk in delta.tool_calls:
+                                    idx = tc_chunk.index
+                                    if idx not in tool_calls:
+                                        tool_calls[idx] = tc_chunk
+                                    else:
+                                        # Consolidate arguments
+                                        if tc_chunk.function.arguments:
+                                            if not tool_calls[idx].function.arguments:
+                                                tool_calls[idx].function.arguments = ""
+                                            tool_calls[idx].function.arguments += tc_chunk.function.arguments
+                        
+                        # Process based on how it finished
+                        if tool_calls:
+                            # Convert dict to list and append to session
+                            tc_list = list(tool_calls.values())
+                            # Create a proper message object for the session
+                            # Note: we need to handle the conversion from streaming TC to proper TC
+                            assistant_msg = {"role": "assistant", "tool_calls": []}
+                            for tc in tc_list:
+                                assistant_msg["tool_calls"].append({
+                                    "id": tc.id,
+                                    "type": "function",
+                                    "function": {
+                                        "name": tc.function.name,
+                                        "arguments": tc.function.arguments
+                                    }
+                                })
+                            
+                            sessions[session_id].append(assistant_msg)
+                            
+                            # Execute tools
+                            for tc in assistant_msg["tool_calls"]:
+                                fn_name = tc["function"]["name"]
+                                fn_args_raw = tc["function"]["arguments"]
+                                try:
+                                    fn_args = json.loads(fn_args_raw)
+                                except json.JSONDecodeError:
+                                    logger.warning(f"Malformed tool args: {fn_args_raw}")
+                                    fn_args = {}
+
+                                await websocket.send_text(json.dumps({
+                                    "type": "trace",
+                                    "event": f"Tool called: {fn_name}({json.dumps(fn_args)})"
+                                }))
+
+                                result = execute_tool(fn_name, fn_args)
+
+                                await websocket.send_text(json.dumps({
+                                    "type": "trace",
+                                    "event": f"Tool result: {result}"
+                                }))
+
+                                sessions[session_id].append({
+                                    "role": "tool",
+                                    "tool_call_id": tc["id"],
+                                    "content": result
+                                })
+                            # Continue to next iteration to get assistant response to tool results
+                            continue
+                            
+                        else:
+                            # Final text response
+                            assistant_text = clean_agent_response(full_content)
+                            sessions[session_id].append({"role": "assistant", "content": assistant_text})
+
+                            t_end = time.time()
+                            latency_ms = round((t_end - t_start) * 1000)
+                            logger.info(f"Response latency: {latency_ms}ms")
+
+                            # Send final notification
                             await websocket.send_text(json.dumps({
                                 "type": "agent.response",
-                                "text": "I'm sorry, I encountered a technical issue. Could you please repeat that?",
-                                "latency_ms": round((time.time() - t_start) * 1000)
+                                "text": assistant_text,
+                                "latency_ms": latency_ms
+                            }))
+
+                            # Background server-side TTS as fallback/high-quality option
+                            try:
+                                audio_b64 = text_to_speech_base64(assistant_text, session_lang)
+                                if audio_b64:
+                                    await websocket.send_text(json.dumps({
+                                        "type": "agent.audio",
+                                        "audio": audio_b64,
+                                        "format": "mp3"
+                                    }))
+                            except Exception as tts_err:
+                                logger.error(f"TTS error: {tts_err}")
+
+                            await websocket.send_text(json.dumps({
+                                "type": "trace",
+                                "event": f"Agent responded in {latency_ms}ms"
                             }))
                             break
 
-                    choice = response.choices[0]
-
-                    if choice.finish_reason == "tool_calls" and choice.message.tool_calls:
-                        # Append assistant message with tool calls
-                        sessions[session_id].append(choice.message)
-
-                        for tool_call in choice.message.tool_calls:
-                            fn_name = tool_call.function.name
-                            try:
-                                fn_args = json.loads(tool_call.function.arguments)
-                            except json.JSONDecodeError:
-                                logger.warning(f"Malformed tool args: {tool_call.function.arguments}")
-                                fn_args = {}
-
-                            await websocket.send_text(json.dumps({
-                                "type": "trace",
-                                "event": f"Tool called: {fn_name}({json.dumps(fn_args)})"
-                            }))
-
-                            result = execute_tool(fn_name, fn_args)
-
-                            await websocket.send_text(json.dumps({
-                                "type": "trace",
-                                "event": f"Tool result: {result}"
-                            }))
-
-                            sessions[session_id].append({
-                                "role": "tool",
-                                "tool_call_id": tool_call.id,
-                                "content": result
-                            })
-                    else:
-                        # Final text response
-                        raw_text = choice.message.content or ""
-                        assistant_text = clean_agent_response(raw_text)
-                        logger.info(f"Raw LLM output: {raw_text}")
-                        logger.info(f"Cleaned output: {assistant_text}")
-                        sessions[session_id].append({"role": "assistant", "content": assistant_text})
-
-                        t_end = time.time()
-                        latency_ms = round((t_end - t_start) * 1000)
-                        logger.info(f"Response latency: {latency_ms}ms")
-
+                    except Exception as api_err:
+                        logger.info(f"Retrying with Groq...") # Log retry intent
+                        logger.error(f"Error in Groq streaming: {api_err}", exc_info=True)
                         await websocket.send_text(json.dumps({
                             "type": "agent.response",
-                            "text": assistant_text,
-                            "latency_ms": latency_ms
-                        }))
-
-                        # Generate TTS audio on the server and send it
-                        try:
-                            audio_b64 = text_to_speech_base64(assistant_text, session_lang)
-                            if audio_b64:
-                                await websocket.send_text(json.dumps({
-                                    "type": "agent.audio",
-                                    "audio": audio_b64,
-                                    "format": "mp3"
-                                }))
-                                logger.info(f"TTS audio sent ({len(audio_b64)} chars base64)")
-                            else:
-                                logger.warning("TTS returned no audio")
-                        except Exception as tts_err:
-                            logger.error(f"TTS error: {tts_err}")
-
-                        await websocket.send_text(json.dumps({
-                            "type": "trace",
-                            "event": f"Agent responded in {latency_ms}ms"
+                            "text": "I'm sorry, I encountered an error. Could you repeat that?",
+                            "latency_ms": 0
                         }))
                         break
 
