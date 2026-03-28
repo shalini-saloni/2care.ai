@@ -1,7 +1,6 @@
 import React, { useState, useRef, useCallback, useEffect } from 'react';
 import { Mic, MicOff, PhoneCall, Activity, Volume2, Languages } from 'lucide-react';
 
-// Extend Window for webkitSpeechRecognition
 declare global {
   interface Window {
     webkitSpeechRecognition: any;
@@ -45,16 +44,13 @@ export default function App() {
     }]);
   }, []);
 
-  // Auto-scroll logs
   useEffect(() => {
     logsEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [logs]);
 
-  // Speak text using browser SpeechSynthesis with queue management
   const speakChunk = useCallback((text: string) => {
     if (!text.trim()) return;
 
-    // Add to queue
     speechQueueRef.current.push(text);
 
     const processQueue = () => {
@@ -66,7 +62,6 @@ export default function App() {
       const synth = window.speechSynthesis;
       const utterance = new SpeechSynthesisUtterance(nextText);
 
-      // Map language
       const lang = selectedLangRef.current;
       if (lang.startsWith('hi')) utterance.lang = 'hi-IN';
       else if (lang.startsWith('ta')) utterance.lang = 'ta-IN';
@@ -79,7 +74,7 @@ export default function App() {
 
       utterance.onend = () => {
         isInternalSpeakingRef.current = false;
-        processQueue(); // Process next in queue
+        processQueue(); 
         if (speechQueueRef.current.length === 0) {
           setIsSpeaking(false);
         }
@@ -97,9 +92,7 @@ export default function App() {
     processQueue();
   }, []);
 
-  // Play base64-encoded MP3 audio from the server (Fallback)
   const playAudio = useCallback((audioBase64: string) => {
-    // If we are already speaking chunks, ignore the final audio block to avoid doubling
     if (isInternalSpeakingRef.current || speechQueueRef.current.length > 0) {
       console.log('[Audio] Ignoring server audio because streaming TTS is active');
       return;
@@ -160,7 +153,6 @@ export default function App() {
           const content = data.text || '';
           setAgentText(prev => prev + content);
 
-          // Speak chunks as they arrive (heuristic: speak on punctuation or length)
           const cleanChunk = content.replace(/[*#_]/g, '');
           if (cleanChunk.match(/[.!?\n]/)) {
             speakChunk(cleanChunk);
@@ -168,20 +160,17 @@ export default function App() {
         }
 
         if (data.type === 'agent.response') {
-          // Final text arrived
           setLatency(data.latency_ms);
           addLog(`Agent responded in ${data.latency_ms}ms`, 'info');
-
-          // Ensure any remaining text in the buffer is spoken
-          // We can use a small delay to see if everything was already spoken via chunks
         }
 
-        // Play server-generated TTS audio (Fallback/Higher Quality)
         if (data.type === 'agent.audio' && data.audio) {
           console.log('[Audio] Received final audio block');
           playAudio(data.audio);
         }
-      } catch (e) { /* ignore */ }
+      } catch (e) {
+        console.log(e)
+      }
     };
 
     ws.onclose = () => {
@@ -212,7 +201,7 @@ export default function App() {
       synth.speak(unlockUtterance);
     }
 
-    setAgentText(''); // Clear previous response
+    setAgentText(''); 
     connectWebSocket();
 
     const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
@@ -243,7 +232,6 @@ export default function App() {
       setTranscript(interimTranscript || finalTranscript);
 
       if (finalTranscript.trim()) {
-        // Barge-in: stop EVERYTHING
         window.speechSynthesis.cancel();
         speechQueueRef.current = [];
         isInternalSpeakingRef.current = false;
@@ -254,7 +242,6 @@ export default function App() {
         }
         setIsSpeaking(false);
 
-        // Send final transcript to backend with language preference
         if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
           wsRef.current.send(JSON.stringify({
             type: 'user.message',
@@ -296,9 +283,9 @@ export default function App() {
   }, [addLog]);
 
   const langOptions = [
-    { code: 'en-IN', label: 'English', flag: '🇬🇧' },
-    { code: 'hi-IN', label: 'Hindi', flag: '🇮🇳' },
-    { code: 'ta-IN', label: 'Tamil', flag: '🇮🇳' },
+    { code: 'en-IN', label: 'English'},
+    { code: 'hi-IN', label: 'Hindi'},
+    { code: 'ta-IN', label: 'Tamil'},
   ];
 
   return (

@@ -19,21 +19,15 @@ def clean_agent_response(text: str) -> str:
       <function=book_appointment>...</function>
     This must be removed before displaying or speaking the response.
     """
-    # Remove -function=name>... and <function=name>... patterns
-    # Matches starting with '-' or '<', followed by 'function=', then name, then optional JSON/XML
+    
     text = re.sub(r'[-<]function=\w+>.*?(?:</function>|$)', '', text, flags=re.DOTALL | re.IGNORECASE)
     
-    # Remove any remaining lone <function> or </function> tags
     text = re.sub(r'</?function[^>]*>', '', text, flags=re.IGNORECASE)
     
-    # Remove any stray JSON-like blocks that look like function args if they are alone
-    # (e.g., {"doctor_id": "doc_1"}) if they appear at the start/end of a line
     text = re.sub(r'^\s*\{".*?"\s*:\s*".*?"\}\s*$', '', text, flags=re.MULTILINE)
 
-    # Remove markdown bold/italic/headers
     text = re.sub(r'[*#_]+', '', text)
     
-    # Clean up extra whitespace and newlines
     text = re.sub(r'\s{2,}', ' ', text)
     return text.strip()
 
@@ -46,7 +40,6 @@ def get_groq_client():
         raise ValueError("GROQ_API_KEY is not set! Please update backend/.env with your real key.")
     return Groq(api_key=api_key)
 
-# Per-session conversation history (in-memory, keyed by session)
 sessions: dict[str, list] = {}
 
 def execute_tool(name: str, args: dict) -> str:
@@ -77,7 +70,7 @@ async def handle_websocket_connection(websocket: WebSocket):
     await websocket.accept()
     session_id = str(uuid.uuid4())
     sessions[session_id] = [{"role": "system", "content": SESSION_INSTRUCTIONS}]
-    session_lang = "en"  # Track user's language preference
+    session_lang = "en"  
     logger.info(f"Client connected. Session: {session_id}")
 
     await websocket.send_text(json.dumps({
@@ -92,7 +85,7 @@ async def handle_websocket_connection(websocket: WebSocket):
 
             if data.get("type") == "user.message":
                 user_text = data.get("text", "")
-                # Track language preference from frontend
+                
                 if data.get("lang"):
                     lang_code = data["lang"]
                     if lang_code.startswith("hi"):
@@ -113,11 +106,9 @@ async def handle_websocket_connection(websocket: WebSocket):
                     "event": f'User said: "{user_text}"'
                 }))
 
-                # Call Groq with tool support — loop until final text response
                 max_iterations = 5
                 for iteration in range(max_iterations):
                     try:
-                        # We use streaming to reduce latency
                         stream = get_groq_client().chat.completions.create(
                             model="llama-3.1-8b-instant",
                             messages=sessions[session_id],
@@ -128,7 +119,7 @@ async def handle_websocket_connection(websocket: WebSocket):
                         )
                         
                         full_content = ""
-                        tool_calls = {} # tool_index -> tool_call_object
+                        tool_calls = {} 
                         finish_reason = None
                         
                         for chunk in stream:
@@ -138,35 +129,29 @@ async def handle_websocket_connection(websocket: WebSocket):
                             delta = chunk.choices[0].delta
                             finish_reason = chunk.choices[0].finish_reason
                             
-                            # Handle content chunks
                             if delta.content:
                                 content = delta.content
                                 full_content += content
-                                # Send chunk to frontend immediately for low-latency display
+                                
                                 await websocket.send_text(json.dumps({
                                     "type": "agent.response_chunk",
                                     "text": content
                                 }))
                             
-                            # Handle tool call chunks
                             if delta.tool_calls:
                                 for tc_chunk in delta.tool_calls:
                                     idx = tc_chunk.index
                                     if idx not in tool_calls:
                                         tool_calls[idx] = tc_chunk
                                     else:
-                                        # Consolidate arguments
                                         if tc_chunk.function.arguments:
                                             if not tool_calls[idx].function.arguments:
                                                 tool_calls[idx].function.arguments = ""
                                             tool_calls[idx].function.arguments += tc_chunk.function.arguments
                         
-                        # Process based on how it finished
                         if tool_calls:
-                            # Convert dict to list and append to session
                             tc_list = list(tool_calls.values())
-                            # Create a proper message object for the session
-                            # Note: we need to handle the conversion from streaming TC to proper TC
+                            
                             assistant_msg = {"role": "assistant", "tool_calls": []}
                             for tc in tc_list:
                                 assistant_msg["tool_calls"].append({
@@ -180,7 +165,6 @@ async def handle_websocket_connection(websocket: WebSocket):
                             
                             sessions[session_id].append(assistant_msg)
                             
-                            # Execute tools
                             for tc in assistant_msg["tool_calls"]:
                                 fn_name = tc["function"]["name"]
                                 fn_args_raw = tc["function"]["arguments"]
@@ -207,11 +191,9 @@ async def handle_websocket_connection(websocket: WebSocket):
                                     "tool_call_id": tc["id"],
                                     "content": result
                                 })
-                            # Continue to next iteration to get assistant response to tool results
                             continue
                             
                         else:
-                            # Final text response
                             assistant_text = clean_agent_response(full_content)
                             sessions[session_id].append({"role": "assistant", "content": assistant_text})
 
@@ -219,14 +201,12 @@ async def handle_websocket_connection(websocket: WebSocket):
                             latency_ms = round((t_end - t_start) * 1000)
                             logger.info(f"Response latency: {latency_ms}ms")
 
-                            # Send final notification
                             await websocket.send_text(json.dumps({
                                 "type": "agent.response",
                                 "text": assistant_text,
                                 "latency_ms": latency_ms
                             }))
 
-                            # Background server-side TTS as fallback/high-quality option
                             try:
                                 audio_b64 = text_to_speech_base64(assistant_text, session_lang)
                                 if audio_b64:
@@ -245,7 +225,7 @@ async def handle_websocket_connection(websocket: WebSocket):
                             break
 
                     except Exception as api_err:
-                        logger.info(f"Retrying with Groq...") # Log retry intent
+                        logger.info(f"Retrying with Groq...") 
                         logger.error(f"Error in Groq streaming: {api_err}", exc_info=True)
                         await websocket.send_text(json.dumps({
                             "type": "agent.response",
@@ -258,7 +238,6 @@ async def handle_websocket_connection(websocket: WebSocket):
         logger.info(f"Client disconnected. Session: {session_id}")
     except Exception as e:
         logger.error(f"Unhandled error: {e}", exc_info=True)
-        # Send error to client instead of crashing
         try:
             await websocket.send_text(json.dumps({
                 "type": "agent.response",

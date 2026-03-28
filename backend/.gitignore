@@ -1,2 +1,13 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+
+# Env
 .env
+
+# Node
+node_modules/
+
+# DB
 *.db
