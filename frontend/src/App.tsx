@@ -129,7 +129,7 @@ export default function App() {
   const connectWebSocket = useCallback(() => {
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) return;
 
-    const ws = new WebSocket('ws://localhost:8001/ws/voice');
+    const ws = new WebSocket(import.meta.env.VITE_WS_URL);
 
     ws.onopen = () => {
       setIsConnected(true);
