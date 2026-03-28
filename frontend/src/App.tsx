@@ -1,4 +1,4 @@
-import React, { useState, useRef, useCallback, useEffect } from 'react';
+import { useState, useRef, useCallback, useEffect } from 'react';
 import { Mic, MicOff, PhoneCall, Activity, Volume2, Languages } from 'lucide-react';
 
 declare global {
@@ -313,7 +313,7 @@ export default function App() {
               : 'bg-gray-800 text-gray-400 hover:bg-gray-700'
               }`}
           >
-            {lang.flag} {lang.label}
+            {lang.label}
           </button>
         ))}
       </div>
